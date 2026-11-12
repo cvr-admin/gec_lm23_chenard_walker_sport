@@ -8,9 +8,11 @@ tyrevKMs = {} --store the tyre vKMs here
 tyreWear = {}
 prevTyreWear = {}
 tyrePunctureRates = {}
+tyrePunctureStartVirtualKM = {}
 isCarInPits = false
 currentSpares = 2 -- get this when exiting pits
 tyreChangeInProgress = false --is the car changing a tyre
+pitCrewTyreChangeInProgress = false
 roadsideTyreChange = 0
 tyreStockEmpty = false
 carStoppedTimer = 0 --the timer to check if car is stopped for a tyre replacement
@@ -27,7 +29,298 @@ local maxDistanceBetweenTyreStacks = 1000
 local tyreStacksPerLap = math.max(math.ceil(ac.getSim().trackLengthM / maxDistanceBetweenTyreStacks) - 1, 2)
 local tyreStacksPositions = {}
 
-local tyreReplacementTime = ac.INIConfig.carData(0, 'car.ini'):get('PIT_STOP', 'TYRE_CHANGE_TIME_SEC', 55)
+local pitStopTyreChangeTime = ac.INIConfig.carData(0, 'car.ini'):get('PIT_STOP', 'TYRE_CHANGE_TIME_SEC', 55)
+local tyreReplacementTime = pitStopTyreChangeTime / 4
+local roadsideTyreReplacementTime = tyreReplacementTime * 1.6
+
+local function resetTyreVirtualKM(tyreIndex, virtualKm)
+    virtualKm = virtualKm or 0
+    if physics and physics.setTyresVirtualKM then
+        local wheelMask = 2 ^ (tyreIndex + 2)
+        return pcall(physics.setTyresVirtualKM, 0, wheelMask, virtualKm)
+    end
+    if ac.overrideSpecificValue and ac.CarPhysicsValueID and ac.CarPhysicsValueID.TyresVirtualKm then
+        return pcall(ac.overrideSpecificValue, ac.CarPhysicsValueID.TyresVirtualKm, virtualKm, tyreIndex)
+    end
+    return false
+end
+
+local cvrPitCrewConnection = nil
+do
+    local ok, connection = pcall(ac.connect, {
+        ac.StructItem.key('cvr.pitCrew.tyres.v1'),
+        requestId = ac.StructItem.uint32(),
+        tyreMask = ac.StructItem.uint8(),
+        appliedRequestId = ac.StructItem.uint32(),
+        appliedMask = ac.StructItem.uint8(),
+        status = ac.StructItem.uint8(),
+        tyreServiceRequestId = ac.StructItem.uint32(),
+        tyreServiceState = ac.StructItem.uint8(),
+        tyreServiceElapsed = ac.StructItem.float(),
+        tyreServiceDuration = ac.StructItem.float(),
+        carIndex = ac.StructItem.int32(),
+        repairRequestId = ac.StructItem.uint32(),
+        repairMask = ac.StructItem.uint8(),
+        repairServiceRequestId = ac.StructItem.uint32(),
+        appliedRepairRequestId = ac.StructItem.uint32(),
+        appliedRepairMask = ac.StructItem.uint8(),
+        repairStatus = ac.StructItem.uint8(),
+        repairNeededMask = ac.StructItem.uint8(),
+        repairServiceCurrentMask = ac.StructItem.uint8(),
+        repairServiceElapsed = ac.StructItem.float(),
+        repairServiceDuration = ac.StructItem.float(),
+    }, true, ac.SharedNamespace.Shared)
+    if ok then
+        cvrPitCrewConnection = connection
+    end
+end
+local cvrPitCrewLastRequestId = 0
+local cvrPitCrewPendingRequestId = 0
+local cvrPitCrewPendingMask = 0
+local cvrPitCrewTimer = 0
+local cvrPitCrewDuration = 0
+local pitCrewTyreServiceCooldown = 0
+local cvrPitCrewRoadsideTyreService = false
+local cvrPitCrewRoadsideTyreServiceCooldown = 0
+local tyrePatchTemperatureResetMask = 0
+local tyrePatchTemperatureResetFrames = 0
+local tyrePatchTemperatureResetFrameCount = 180
+
+-- Kept intentionally separate from the legacy requestId: choosing wheels in
+-- CVR Pit Crew only changes a selection; tyreServiceRequestId starts work.
+local CVR_TYRE_SERVICE_IDLE = 0
+local CVR_TYRE_SERVICE_QUEUED = 1
+local CVR_TYRE_SERVICE_WORKING = 2
+local CVR_TYRE_SERVICE_COMPLETE = 3
+local CVR_TYRE_SERVICE_REJECTED = 4
+
+local function tyreMaskHasWheel(mask, tyreIndex)
+    return math.floor((mask or 0) / (2 ^ tyreIndex)) % 2 == 1
+end
+
+local function countTyresInMask(mask)
+    local count = 0
+    for i = 0, 3 do
+        if tyreMaskHasWheel(mask, i) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function getPitCrewTyreChangeTime(mask)
+    return tyreReplacementTime * countTyresInMask(mask)
+end
+
+function getCVRPitCrewTyreChangeTime(mask)
+    return getPitCrewTyreChangeTime(mask)
+end
+
+local function queueTyrePatchTemperatureReset(mask)
+    tyrePatchTemperatureResetMask = mask
+    tyrePatchTemperatureResetFrames = tyrePatchTemperatureResetFrameCount
+end
+
+local function resetTyrePatchTemperatures(tyreIndex)
+    if ac.shiftPatchTemperatures then
+        return pcall(ac.shiftPatchTemperatures, tyreIndex, 25, 1)
+    end
+    return false
+end
+
+function resetTyreWearTracking(tyreIndex)
+    tyreWear[tyreIndex] = 0.0
+    prevTyreWear[tyreIndex] = thisCar.wheels[tyreIndex].tyreWear or 0.0
+end
+
+-- Keep the pit crew and roadside tyre workflows separate. This is also called
+-- for session resets because controller outputs can outlive an AC restart.
+function resetTyreServiceState()
+    tyreChangeInProgress = false
+    pitCrewTyreChangeInProgress = false
+    tyrevKMs = {}
+    tyrePunctureStartVirtualKM = {}
+    roadsideTyreChange = 0
+    carStoppedTimer = 0
+    blownTyres = false
+    pitCrewTyreServiceCooldown = 0
+    cvrPitCrewLastRequestId = 0
+    cvrPitCrewPendingRequestId = 0
+    cvrPitCrewPendingMask = 0
+    cvrPitCrewTimer = 0
+    cvrPitCrewDuration = 0
+    cvrPitCrewRoadsideTyreService = false
+    cvrPitCrewRoadsideTyreServiceCooldown = 0
+    tyrePatchTemperatureResetMask = 0
+    tyrePatchTemperatureResetFrames = 0
+
+    if cvrPitCrewConnection then
+        cvrPitCrewConnection.tyreMask = 0
+        cvrPitCrewConnection.status = 0
+        cvrPitCrewConnection.tyreServiceRequestId = 0
+        cvrPitCrewConnection.tyreServiceState = CVR_TYRE_SERVICE_IDLE
+        cvrPitCrewConnection.tyreServiceElapsed = 0
+        cvrPitCrewConnection.tyreServiceDuration = 0
+    end
+    if acCarPhysics and acCarPhysics.controllerInputs then
+        acCarPhysics.controllerInputs[3] = 0
+        acCarPhysics.controllerInputs[42] = 0
+    end
+end
+
+function updateCVRPitCrewTyreOverrides()
+    if tyrePatchTemperatureResetFrames <= 0 or tyrePatchTemperatureResetMask == 0 then
+        return
+    end
+
+    for i = 0, 3 do
+        if tyreMaskHasWheel(tyrePatchTemperatureResetMask, i) then
+            resetTyrePatchTemperatures(i)
+        end
+    end
+
+    tyrePatchTemperatureResetFrames = tyrePatchTemperatureResetFrames - 1
+    if tyrePatchTemperatureResetFrames <= 0 then
+        tyrePatchTemperatureResetMask = 0
+    end
+end
+
+local function servicePitCrewTyre(tyreIndex)
+    ac.setTyreInflation(tyreIndex, tyrePressures[tyreIndex] or 1.0)
+    local virtualKMWasReset = resetTyreVirtualKM(tyreIndex)
+    resetTyrePatchTemperatures(tyreIndex)
+
+    -- Virtual kilometres are an absolute AC counter. A replacement starts at
+    -- zero if the CSP reset succeeds; otherwise retain the current counter so
+    -- its new lifetime is still measured from the moment of service.
+    local currentVirtualKM = virtualKMWasReset and 0 or (thisCar.wheels[tyreIndex].tyreVirtualKM or 0)
+    tyrePunctureStartVirtualKM[tyreIndex] = currentVirtualKM
+    tyrevKMs[tyreIndex] = currentVirtualKM + generateTyrevKM()
+    tyrePunctureDeflateFactor[tyreIndex] = 0.0
+    tyrePuncturePressureFactor[tyreIndex] = 0.0
+    resetTyreWearTracking(tyreIndex)
+end
+
+local function holdCarForPitCrewTyreChange()
+    pitCrewTyreChangeInProgress = true
+    acCarPhysics.gas = 0
+    acCarPhysics.brake = 1
+    acCarPhysics.handbrake = 1
+
+    if forceEngineStall then
+        forceEngineStall()
+    else
+        ac.setEngineRPM(0)
+    end
+end
+
+function isCVRPitCrewTyreServiceActive()
+    return pitCrewTyreChangeInProgress or cvrPitCrewPendingRequestId ~= 0
+end
+
+local function setCVRPitCrewTyreServiceState(state, elapsed, duration)
+    if not cvrPitCrewConnection then
+        return
+    end
+    cvrPitCrewConnection.tyreServiceState = state
+    cvrPitCrewConnection.tyreServiceElapsed = math.max(0, elapsed or 0)
+    cvrPitCrewConnection.tyreServiceDuration = math.max(0, duration or 0)
+    cvrPitCrewConnection.carIndex = thisCar.index or 0
+end
+
+function applyCVRPitCrewTyreSelection(dt)
+    if not cvrPitCrewConnection then
+        pitCrewTyreChangeInProgress = false
+        return
+    end
+
+    local requestId = tonumber(cvrPitCrewConnection.tyreServiceRequestId) or 0
+    local tyreMask = tonumber(cvrPitCrewConnection.tyreMask) or 0
+    if requestId == 0 or requestId == cvrPitCrewLastRequestId then
+        pitCrewTyreChangeInProgress = false
+        return
+    end
+
+    if requestId ~= cvrPitCrewPendingRequestId then
+        if tyreMask == 0 then
+            cvrPitCrewLastRequestId = requestId
+            cvrPitCrewConnection.status = 2
+            setCVRPitCrewTyreServiceState(CVR_TYRE_SERVICE_REJECTED, 0, 0)
+            return
+        end
+
+        cvrPitCrewPendingRequestId = requestId
+        cvrPitCrewPendingMask = tyreMask
+        cvrPitCrewTimer = 0
+        cvrPitCrewDuration = getPitCrewTyreChangeTime(tyreMask)
+        cvrPitCrewConnection.status = 3
+    end
+
+    -- A confirmed request may be made before reaching the pit box. It remains
+    -- visibly queued and does not silently start anywhere else on the track.
+    if not isCarInPits then
+        pitCrewTyreChangeInProgress = false
+        setCVRPitCrewTyreServiceState(CVR_TYRE_SERVICE_QUEUED,
+            cvrPitCrewTimer, cvrPitCrewDuration)
+        return
+    end
+
+    -- Some cars need the tyre crew and mechanical repair crew to work in
+    -- sequence. Keep the accepted tyre request pending until the repair queue
+    -- is clear, then run the normal tyre service.
+    if pitTyreChangesCanRunWithRepairs == false
+            and isCustomPitRepairQueueActive and isCustomPitRepairQueueActive() then
+        pitCrewTyreChangeInProgress = false
+        cvrPitCrewConnection.status = 3
+        setCVRPitCrewTyreServiceState(CVR_TYRE_SERVICE_QUEUED,
+            cvrPitCrewTimer, cvrPitCrewDuration)
+        return
+    end
+
+    if cvrPitCrewTimer == 0 then
+        overheadMessageQueue("Pit crew", string.format("Changing selected tyres: %.0f s", cvrPitCrewDuration), 3)
+    end
+
+    holdCarForPitCrewTyreChange()
+    cvrPitCrewTimer = cvrPitCrewTimer + (dt or 0)
+    setCVRPitCrewTyreServiceState(CVR_TYRE_SERVICE_WORKING,
+        cvrPitCrewTimer, cvrPitCrewDuration)
+    printDebug("CVR Pit crew time", string.format("%.1f / %.1f", cvrPitCrewTimer, cvrPitCrewDuration))
+    if cvrPitCrewTimer < cvrPitCrewDuration then
+        cvrPitCrewConnection.status = 3
+        return
+    end
+
+    cvrPitCrewLastRequestId = requestId
+    local appliedMask = 0
+    for i = 0, 3 do
+        if tyreMaskHasWheel(cvrPitCrewPendingMask, i) then
+            servicePitCrewTyre(i)
+            appliedMask = appliedMask + 2 ^ i
+        end
+    end
+
+    cvrPitCrewConnection.appliedRequestId = requestId
+    cvrPitCrewConnection.appliedMask = appliedMask
+    cvrPitCrewConnection.status = appliedMask > 0 and 1 or 2
+    cvrPitCrewConnection.carIndex = thisCar.index or 0
+    cvrPitCrewConnection.tyreMask = 0
+    setCVRPitCrewTyreServiceState(appliedMask > 0
+        and CVR_TYRE_SERVICE_COMPLETE or CVR_TYRE_SERVICE_REJECTED,
+        cvrPitCrewDuration, cvrPitCrewDuration)
+    cvrPitCrewPendingRequestId = 0
+    cvrPitCrewPendingMask = 0
+    cvrPitCrewTimer = 0
+    cvrPitCrewDuration = 0
+    pitCrewTyreChangeInProgress = false
+    pitCrewTyreServiceCooldown = 0.25
+
+    if appliedMask > 0 then
+        queueTyrePatchTemperatureReset(appliedMask)
+        overheadMessageQueue("Pit crew", "Selected tyres changed.", 3)
+        printDebug("CVR Pit crew", string.format("Applied mask %d", appliedMask))
+    end
+end
 
 function initTyrePunctureRates()
     for i = 0, 3 do
@@ -82,14 +375,14 @@ end
 -- the distance to the closest tyre stack.
 function getTyreChangeTime()
     if currentSpares >= 0 then
-        return tyreReplacementTime
+        return roadsideTyreReplacementTime
     end
 
     local jeffRunSpeedMs = 4.0
     local timeToTyreStackAndBack = getDistanceToClosestTyreStack() / jeffRunSpeedMs * 2
     printDebug("Time to tyre stack and back", timeToTyreStackAndBack)
 
-    return tyreReplacementTime + timeToTyreStackAndBack
+    return roadsideTyreReplacementTime + timeToTyreStackAndBack
 end
 
 function getCurrentSpares()
@@ -146,7 +439,15 @@ function tyreBlow()
 
     for i = 0, 3 do
         -- Car must be out of the pits and not in the grid, moving and tyre must not be already punctured.
-        if checkTyreBlow and tyrePunctureDeflateFactor[i] == 0.0 then
+        local currentVirtualKM = thisCar.wheels[i].tyreVirtualKM or 0
+        local fittedVirtualKM = tyrePunctureStartVirtualKM[i]
+        local distanceSinceFitted = fittedVirtualKM ~= nil and math.max(0, currentVirtualKM - fittedVirtualKM) or 0
+        local punctureRunInComplete = distanceSinceFitted >= tyrePunctureWarmupDistanceKm
+
+        -- A fresh tyre can still fail from over-pressure or a collision, but
+        -- do not roll background wear/debris punctures before it has completed
+        -- a small run-in distance. This prevents random leaks during formation.
+        if checkTyreBlow and punctureRunInComplete and tyrePunctureDeflateFactor[i] == 0.0 then
             local rateToUse = 0
 
             if thisCar.wheels[i].surfaceExtendedType == ac.SurfaceExtendedType.Gravel then
@@ -169,6 +470,7 @@ function tyreBlow()
             -- 1 meaning fully worn tyres.
             local tyreWearFactor = 1.0 - math.min(tyreWear[i] * tyreTypeFactor, 0.999)
             rateToUse = math.floor(rateToUse * tyreWearFactor + 0.5)
+            rateToUse = scaleFailureRateForRaceLength(rateToUse)
             printDebug(string.format("Puncture rate, tyre: %d", i), string.format("%d", rateToUse))
             tyrePunctureRates[i] = rateToUse
 
@@ -193,7 +495,8 @@ function tyreBlow()
             end
         end
         --check tyrevKM and blow it if its past its life
-        if thisCar.wheels[i].tyreVirtualKM > tyrevKMs[i] and thisCar.wheels[i].isBlown == false and tyrePunctureDeflateFactor[i] == 0.0 then
+        if punctureRunInComplete and thisCar.wheels[i].tyreVirtualKM > tyrevKMs[i]
+                and thisCar.wheels[i].isBlown == false and tyrePunctureDeflateFactor[i] == 0.0 then
             generateSlowPuncture(i, minPunctureDeflateFactor, maxPunctureDeflateFactor)
 
             if currentSpares > 0 then
@@ -238,10 +541,17 @@ end
 
 function updateTyreWear()
     for i = 0, 3 do
-        if thisCar.wheels[i].tyreWear > prevTyreWear[i] then
-            local wearDiff = thisCar.wheels[i].tyreWear - prevTyreWear[i]
+        local currentWear = thisCar.wheels[i].tyreWear or 0.0
+        local previousWear = prevTyreWear[i]
+
+        -- CSP can reset raw wear after the pit service completes. Rebase the
+        -- tracker instead of counting a previous tyre's wear a second time.
+        if previousWear == nil or currentWear < previousWear then
+            prevTyreWear[i] = currentWear
+        elseif currentWear > previousWear then
+            local wearDiff = currentWear - previousWear
             tyreWear[i] = tyreWear[i] + wearDiff
-            prevTyreWear[i] = thisCar.wheels[i].tyreWear
+            prevTyreWear[i] = currentWear
             printDebug(string.format("tyreWear " .. i), tyreWear[i])
         end
     end
@@ -312,8 +622,57 @@ end
 
 --tyre replacement bits - this function is the whole routine
 function tyreReplacement(dt)
-    --dont check if speed is just 0, chances are that ac sometimes breaks and doesnt let you come to a full stop
-    if (thisCar.speedKmh < 1 and thisCar.handbrake == 1 or tyreChangeInProgress) and not isRepairingBelt then
+    local requestedTyreMask = 0
+    for tyreIndex = 0, 3 do
+        if isCVRPitCrewRoadsideTyreRequested and isCVRPitCrewRoadsideTyreRequested(tyreIndex) then
+            requestedTyreMask = requestedTyreMask + 2 ^ tyreIndex
+        end
+    end
+    local appRoadsideRequest = requestedTyreMask > 0
+    local speedKmh = thisCar.speedKmh or 0
+    local stoppedForRoadsideService = not isCarInPits and appRoadsideRequest and speedKmh < 1
+
+    if cvrPitCrewRoadsideTyreServiceCooldown > 0 then
+        cvrPitCrewRoadsideTyreServiceCooldown = math.max(0, cvrPitCrewRoadsideTyreServiceCooldown - (dt or 0))
+        carStoppedTimer = 0
+        roadsideTyreChange = 0
+        acCarPhysics.controllerInputs[3] = 0
+        return
+    end
+
+    if cvrPitCrewRoadsideTyreService and (speedKmh > 2 or isCarInPits) then
+        tyreChangeInProgress = false
+        roadsideTyreChange = 0
+        carStoppedTimer = 0
+        cvrPitCrewRoadsideTyreService = false
+        cvrPitCrewRoadsideTyreServiceCooldown = 0.25
+        if cancelCVRPitCrewRoadsideService then
+            cancelCVRPitCrewRoadsideService()
+        end
+        return
+    end
+
+    -- The pit crew holds the handbrake while working. Keep the post-service
+    -- cooldown so a completed tyre service cannot immediately restart.
+    if pitCrewTyreChangeInProgress or pitCrewTyreServiceCooldown > 0 then
+        carStoppedTimer = 0
+        roadsideTyreChange = 0
+        acCarPhysics.controllerInputs[3] = 0
+        pitCrewTyreServiceCooldown = math.max(0, pitCrewTyreServiceCooldown - (dt or 0))
+        return
+    end
+
+    -- Roadside work requires an active explicit request. Clearing this state
+    -- when none is active prevents stale progress and messages persisting.
+    if not tyreChangeInProgress and not stoppedForRoadsideService then
+        carStoppedTimer = 0
+        roadsideTyreChange = 0
+        acCarPhysics.controllerInputs[3] = 0
+        return
+    end
+
+    -- Do not start a tyre change while another roadside repair owns the car.
+    if not isRepairingBelt then
         carStoppedTimer = carStoppedTimer + dt
 
         --starting the tyre replacement routine
@@ -321,7 +680,8 @@ function tyreReplacement(dt)
             --check that there is actually a burst tyre
             blownTyres = false
             for i = 0, 3 do
-                if thisCar.wheels[i].isBlown or tyrePunctureDeflateFactor[i] > 0.0 then
+                if (thisCar.wheels[i].isBlown or tyrePunctureDeflateFactor[i] > 0.0)
+                        and (not appRoadsideRequest or tyreMaskHasWheel(requestedTyreMask, i)) then
                     tyreChangeInProgress = true
                     blownTyres = true
                 end
@@ -331,7 +691,7 @@ function tyreReplacement(dt)
             if currentSpares == 0 then
                 tyreChangeInProgress = false
                 blownTyres = false
-                ac.setSystemMessage("You have no spare tyres left", "Drive carefully to the pits")
+                overheadMessageQueue("No spare tyres", "Drive carefully to the pits", 4, true)
             end
             if blownTyres == false then
                 carStoppedTimer = 0
@@ -340,19 +700,25 @@ function tyreReplacement(dt)
 
         --tyre change routine, seize controls
         if tyreChangeInProgress then
+            if appRoadsideRequest and not cvrPitCrewRoadsideTyreService then
+                cvrPitCrewRoadsideTyreService = true
+                if beginCVRPitCrewRoadsideService then
+                    beginCVRPitCrewRoadsideService()
+                end
+            end
             acCarPhysics.gas = 0
             acCarPhysics.brake = 1
             acCarPhysics.handbrake = 1
             local tyreChangeTime = getTyreChangeTime()
-            if carStoppedTimer < tyreChangeTime - tyreReplacementTime then
-                ac.setSystemMessage("Fetching tyre", "Getting a tyre from the nearest stack...")
+            if carStoppedTimer < tyreChangeTime - roadsideTyreReplacementTime then
+                overheadMessageQueue("Tyre service", "Fetching a tyre from the nearest stack...", 1, true)
                 roadsideTyreChange = 1
             else
-                ac.setSystemMessage("Changing tyre", "Sit tight...")
+                overheadMessageQueue("Tyre service", "Changing tyre. Hold position until done.", 1, true)
                 roadsideTyreChange = 2
             end
-            --skip the queue for this because its essential info regardless
-            --and also breaks the queue by spamming it
+            -- Refresh the queued message with override so roadside progress
+            -- remains visible without accumulating duplicate notifications.
 
             --end the routine once the time has passed
             if carStoppedTimer > getTyreChangeTime() then
@@ -370,13 +736,27 @@ function tyreReplacement(dt)
                 end
                 carStoppedTimer = 0
                 for i = 0, 3 do
-                    if thisCar.wheels[i].isBlown or tyrePunctureDeflateFactor[i] > 0.0 then
+                    if (thisCar.wheels[i].isBlown or tyrePunctureDeflateFactor[i] > 0.0)
+                            and (not cvrPitCrewRoadsideTyreService or tyreMaskHasWheel(requestedTyreMask, i)) then
                         ac.setTyreInflation(i, tyrePressures[i])
-                        --because current vKM doesnt reset when just reinflating the tyre, add the existing vKM on top.
-                        tyrevKMs[i] = thisCar.wheels[i].tyreVirtualKM + generateTyrevKM()
+                        if resetTyreVirtualKM(i) then
+                            tyrePunctureStartVirtualKM[i] = 0
+                            tyrevKMs[i] = generateTyrevKM()
+                        else
+                            -- Fallback for older CSP builds where reinflation does not reset tyre vKM.
+                            tyrePunctureStartVirtualKM[i] = thisCar.wheels[i].tyreVirtualKM or 0
+                            tyrevKMs[i] = tyrePunctureStartVirtualKM[i] + generateTyrevKM()
+                        end
                         tyrePunctureDeflateFactor[i] = 0.0
                         -- Reset the tyre wear for the replaced tyre.
-                        tyreWear[i] = 0.0
+                        resetTyreWearTracking(i)
+                        if cvrPitCrewRoadsideTyreService then
+                            cvrPitCrewRoadsideTyreService = false
+                            cvrPitCrewRoadsideTyreServiceCooldown = 0.25
+                            if completeCVRPitCrewRoadsideTyreService then
+                                completeCVRPitCrewRoadsideTyreService(i)
+                            end
+                        end
                         break;
                     end
                 end--find the first tyre and repair it

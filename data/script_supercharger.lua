@@ -38,7 +38,7 @@ function initTurboVariables(ac_, printDebug_)
         local targetFactor = math.random(turboBoostAfterFailurePercentMin, turboBoostAfterFailurePercentMax) / 100
         turbo["targetBoostValue"] = maxBoost * targetFactor
         turbo["failureActive"] = false
-        turbo["currentTurboFailureRate"] = turboFailureRate
+        turbo["currentTurboFailureRate"] = scaleFailureRateForRaceLength(turboFailureRate)
         turbo["active"] = true
         turbo["loggedFailure"] = false
         turbos[i] = turbo
@@ -59,7 +59,7 @@ function updateTurboState(logDebug)
             if turbos[i]["failureActive"] == false then
                 turbos[i]["currentTurboFailureRate"] = math.max(
                     turbos[i]["currentTurboFailureRate"] - turboFailureRateStep,
-                    turboFailureRateMin
+                    scaleFailureRateForRaceLength(turboFailureRateMin)
                 )
                 printDebug("currentTurboFailureRate " .. i, "" .. turbos[i]["currentTurboFailureRate"])
             end

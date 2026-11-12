@@ -13,12 +13,19 @@ local neutralTimer = neutralTimer or 0
 local neutralDelay = 0.4   -- 0.01 = 1 ms debounce for Neutral
 local pendingNeutral = false
 
+-- anim helper
+local anim_state = 1
+
 -- persistent state
 psg_engageDelayRaw   = psg_engageDelayRaw   or 0.15
 --psg_fs_protection = psg_fs_protection   or true   -- bool
 
 if psg_fs_protection == nil then
   psg_fs_protection = false
+end
+
+if psg_ds_protection == nil then
+  psg_ds_protection = true
 end
 
 psg_fs_pro_delay  = psg_fs_pro_delay   or 0.1   -- seconds off additional delay - standard: 0.1
@@ -287,7 +294,7 @@ function updatePSG(dt)
             pendingNeutral = false
 
             psg_preselected = lever
-            msgQueue("PRESELECT", gearName(psg_preselected), 1)
+            --msgQueue("PRESELECT", gearName(psg_preselected), 1)
             psg_changed = 1
         end
     end
@@ -298,7 +305,7 @@ function updatePSG(dt)
         pendingNeutral = false
 
         psg_preselected = math.min(psg_preselected + 1, maxGear)
-        msgQueue("PRESELECT", gearName(psg_preselected), 1)
+        --msgQueue("PRESELECT", gearName(psg_preselected), 1)
         psg_changed = 1
     end
 
@@ -308,7 +315,7 @@ function updatePSG(dt)
         pendingNeutral = false
 
         psg_preselected = math.max(psg_preselected - 1, 0)
-        msgQueue("PRESELECT", gearName(psg_preselected), 1)
+        --msgQueue("PRESELECT", gearName(psg_preselected), 1)
         psg_changed = 1
     end
 
@@ -325,7 +332,7 @@ function updatePSG(dt)
         if neutralTimer <= 0 then
             -- Lever stayed in Neutral long enough → accept it
             psg_preselected = 1
-            msgQueue("PRESELECT", "Neutral", 1)
+            --msgQueue("PRESELECT", "Neutral", 1)
             psg_changed = 1
 
             pendingNeutral = false
@@ -384,7 +391,7 @@ function updatePSG(dt)
                     limit = engineLimiter * 0.98
                 end
 
-                if targetRPM > limit then
+                if psg_ds_protection and targetRPM > limit then
                     msgQueue("BLOCKED", "Over-rev protection kicked in!", 1)
                     --msgQueue("BLOCKED", "Over-rev! (" .. math.floor(targetRPM) .. " RPM)", 1)
                     blocked = true
@@ -519,4 +526,23 @@ function updatePSG(dt)
     psg_lastClutch = clutchInput
 
     carPhys.controllerInputs[49] = psg_preselected       -- pre-selected gear saved for other scripts/UI
+    -- msgQueue("PRESELECT", carPhys.controllerInputs[49], 1,true)
+
+
+    -- smoothing anim part
+    if anim_state ~= psg_preselected then
+        if anim_state < psg_preselected then
+            anim_state = anim_state + dt * 8
+            if anim_state > psg_preselected then anim_state = psg_preselected end
+        elseif anim_state > psg_preselected then
+            anim_state = anim_state - dt * 8
+            if anim_state < psg_preselected then anim_state = psg_preselected end
+        end
+        
+        -- P.scriptControllerInputs[83] = anim
+        -- if P.scriptControllerInputs[83] == P.scriptControllerInputs[49] then sAnim = false end
+    end
+
+    carPhys.controllerInputs[83] = anim_state
+
 end

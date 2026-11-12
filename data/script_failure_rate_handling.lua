@@ -6,11 +6,8 @@
 --  * Increase oil pressure problems
 --  * Increase valve damage possibility in high revs
 --
--- At low rpm
---  * Increase spark plug failure
---  * Increase fuel pump failure
---  * Increase oil pressure problems
---  * Increase radiator efficiency
+-- During sustained low-RPM, high-load lugging
+--  * Increase oil-pressure/mechanical risk
 --
 -- Running behind other cars
 --  * Increase fuel pump failure
@@ -24,6 +21,8 @@
 -- Running with high coolant temp
 --  * Increase fuel pump failure
 --  * Increase valve damage possibility
+--  * Increase oil pressure problems
+--  * Increase spark plug failure
 --
 -- Dusty roads
 --  * Reduce radiator efficiency
@@ -41,6 +40,8 @@ local logDebug = nil
 -- Debug logging stuff.
 local overrevving = false
 local lowRpm = false
+local lowRpmSeverity = 0
+local lowRpmLuggingTimer = 0
 local runningCloseToCarInFront = false
 local coolantHandleDebugLoggingCounter = 0
 local coolantHandleDebugLoggingInterval = 14
@@ -55,8 +56,6 @@ local cumulativeRateChanges = {
         oilPressure = 0
     },
     lowRpm = {
-        sparkPlug = 0,
-        fuelPump = 0,
         oilPressure = 0
     },
     runningCloseToCarInFront = {
@@ -65,8 +64,10 @@ local cumulativeRateChanges = {
         oilPressure = 0
     },
     highCoolantTemp = {
+        sparkPlug = 0,
         fuelPump = 0,
-        valveDamage = 0
+        valveDamage = 0,
+        oilPressure = 0
     },
     runningTankLow = {
         fuelPump = 0
@@ -74,6 +75,35 @@ local cumulativeRateChanges = {
 }
 
 local overrevvingState = 0
+radiatorDustClogLevel = radiatorDustClogLevel or 0
+
+sparkPlugFailureRateInitialValue = sparkPlugFailureRateNominalValue
+fuelPumpFailureRateInitialValue = fuelPumpFailureRateNominalValue
+valveFailureRateInitialValue = valveFailureRateNominalValue
+oilPressureFailureRateInitialValue = oilPressureFailureRateNominalValue
+
+local function applySessionFailureRateRandomness(nominalRate)
+    local spread = math.max(failureRateSessionRandomness or 0, 0)
+    local factor = 1 + (math.random() * 2 - 1) * spread
+    return math.max(1, math.floor(nominalRate * factor + 0.5))
+end
+
+local function getRaceLengthSessionFailureRate(nominalRate, minimumValue)
+    return math.max(minimumValue, applySessionFailureRateRandomness(
+        scaleFailureRateForRaceLength(nominalRate, minimumValue)))
+end
+
+function randomizeSessionFailureRates()
+    sparkPlugFailureRateInitialValue = getRaceLengthSessionFailureRate(sparkPlugFailureRateNominalValue, sparkPlugFailureRateMinimumValue)
+    fuelPumpFailureRateInitialValue = getRaceLengthSessionFailureRate(fuelPumpFailureRateNominalValue, fuelPumpFailureRateMinimumValue)
+    valveFailureRateInitialValue = getRaceLengthSessionFailureRate(valveFailureRateNominalValue, valveFailureRateMinimumValue)
+    oilPressureFailureRateInitialValue = getRaceLengthSessionFailureRate(oilPressureFailureRateNominalValue, oilPressureFailureRateMinimumValue)
+end
+
+-- Apply the first per-session scatter immediately so script.lua's initial
+-- live failure-rate values are randomized even if resetCar() is not called
+-- before driving. resetCar() will roll a fresh set for normal session resets.
+randomizeSessionFailureRates()
 
 function initFailureHandlingVariables(printDebug_, logDebug_)
     printDebug = printDebug_
@@ -146,7 +176,12 @@ function handleOverrevving(failureRates, engineRpm)
         printDebug("Overrevving", "ACTIVE")
 
         local rpmOverrevAmount = engineRpm - overrevvingThreshold
-        local progressiveRpmAmount = math.floor((rpmOverrevAmount ^ overrevvingProgressionExponent) * overrevvingRateDecreaseStepFactor + 0.5)
+        local overrevvingRange = math.max(overrevvingThresholdHigh - overrevvingThreshold, 1)
+        local softSeverity = math.clamp(rpmOverrevAmount / overrevvingRange, 0, 1)
+        local hardSeverity = math.clamp((engineRpm - overrevvingThresholdHigh) / overrevvingRange, 0, 3)
+        local softRateStep = (softSeverity ^ overrevvingProgressionExponent) * overrevvingRateDecreaseStepFactor
+        local hardRateStep = hardSeverity * (overrevvingHighRateDecreaseStepFactor or overrevvingRateDecreaseStepFactor * 2.5)
+        local progressiveRpmAmount = math.floor(softRateStep + hardRateStep + 0.5)
 
         failureRates.sparkPlug = failureRates.sparkPlug - progressiveRpmAmount
         failureRates.fuelPump = failureRates.fuelPump - progressiveRpmAmount
@@ -170,39 +205,54 @@ function handleOverrevving(failureRates, engineRpm)
     end
 end
 
-function handleLowRpm(failureRates, engineRpm)
-    local lowRpmThresholdRpm = math.floor(engineMaxRpm * lowRpmThreshold + 0.5)
+function updateLowRpmLugging(engineRpm, throttle, currentGear, speedKmh, dt)
+    local startFactor = lowRpmThreshold or 0.50
+    local severeFactor = lowRpmSevereThreshold or 0.35
+    local lowRpmThresholdRpm = math.floor(engineMaxRpm * startFactor + 0.5)
+    local severeRpm = math.floor(engineMaxRpm * math.min(severeFactor, startFactor - 0.01) + 0.5)
+    local minimumLoad = math.clamp(lowRpmLuggingMinimumLoad or 0.70, 0, 0.99)
+    local isDrivenForwardGear = (currentGear or 0) > 0
+    local isMoving = (speedKmh or 0) > 1
+    local loadSeverity = math.clamp(((throttle or 0) - minimumLoad) / math.max(1 - minimumLoad, 0.01), 0, 1)
+    local rpmSeverity = math.clamp(
+        (lowRpmThresholdRpm - (engineRpm or 0)) / math.max(lowRpmThresholdRpm - severeRpm, 1), 0, 1)
 
-    if engineRpm < lowRpmThresholdRpm then
-        printDebug("Low RPM", "ACTIVE")
-
-        local lowRpmStep = math.floor((lowRpmThresholdRpm - engineRpm) / 100 + 0.5)
-        printDebug("Step", lowRpmStep)
-
-        failureRates.sparkPlug = failureRates.sparkPlug - lowRpmStep
-        failureRates.fuelPump = failureRates.fuelPump - lowRpmStep
-        failureRates.oilPressure = failureRates.oilPressure - lowRpmStep
-
-        cumulativeRateChanges.lowRpm.sparkPlug = cumulativeRateChanges.lowRpm.sparkPlug + lowRpmStep
-        cumulativeRateChanges.lowRpm.fuelPump = cumulativeRateChanges.lowRpm.fuelPump + lowRpmStep
-        cumulativeRateChanges.lowRpm.oilPressure = cumulativeRateChanges.lowRpm.oilPressure + lowRpmStep
-
-        lowRpm = true
-        return true
+    if isMoving and isDrivenForwardGear and loadSeverity > 0 and rpmSeverity > 0 then
+        lowRpmSeverity = rpmSeverity * loadSeverity
+        lowRpmLuggingTimer = lowRpmLuggingTimer + math.max(dt or 0, 0)
+        lowRpm = lowRpmLuggingTimer >= (lowRpmLuggingGraceSeconds or 1.2)
     else
-        printDebug("Low RPM", "inactive")
 
         if lowRpm then
-            logDebug("<FRH>Low RPM, below treshold: " .. engineMaxRpm * lowRpmThreshold)
-            logDebug("Rates after:")
-            logDebug(" SPlug: " .. failureRates.sparkPlug .. ", Fpump: " .. failureRates.fuelPump ..
-                     ", OPres: " .. failureRates.oilPressure)
+            logDebug("<FRH>Low RPM lugging, rates after:")
+            logDebug(" OPres: " .. oilPressureFailureRateBase)
         end
 
         lowRpm = false
+        lowRpmSeverity = 0
+        lowRpmLuggingTimer = 0
+    end
+end
+
+function resetLowRpmLugging()
+    lowRpm = false
+    lowRpmSeverity = 0
+    lowRpmLuggingTimer = 0
+end
+
+function handleLowRpm(failureRates)
+    if not lowRpm then
+        printDebug("Low RPM lugging", "inactive")
+        return false
     end
 
-    return false
+    local lowRpmStep = math.max(1, math.floor(
+        lowRpmSeverity * (lowRpmLuggingRateDecreaseStep or 2) + 0.5))
+    failureRates.oilPressure = failureRates.oilPressure - lowRpmStep
+    cumulativeRateChanges.lowRpm.oilPressure = cumulativeRateChanges.lowRpm.oilPressure + lowRpmStep
+
+    printDebug("Low RPM lugging", string.format("ACTIVE: %.0f%% | step: %d", lowRpmSeverity * 100, lowRpmStep))
+    return true
 end
 
 function handleRunningCloseToCarInFront(failureRates, speed, ac)
@@ -251,19 +301,50 @@ function handleHighCoolantTemp(failureRates, coolantTemp)
     end
     coolantHandleCounter = 0
 
-    local tempDiff = coolantTemp - highEngineTempThreshold
-    if tempDiff > 0 then
-        printDebug("High coolant", "ACTIVE: " .. tempDiff)
-        failureRates.fuelPump = failureRates.fuelPump - math.floor(tempDiff + 0.5)
-        failureRates.valveDamage = failureRates.valveDamage - math.floor(tempDiff + 0.5)
+    local coolantTemperatureExcess = coolantTemp - highEngineTempThreshold
+    if coolantTemperatureExcess > 0 then
+        -- Make hot-running consequences ramp up more aggressively than the old
+        -- simple linear step. A few degrees over the limit is survivable, but
+        -- sustained running deep in the danger zone accelerates failures fast.
+        local temperatureRamp = math.clamp(coolantTemperatureExcess / 20, 0, 1)
+        local fuelPumpFailureRateStep = math.floor(coolantTemperatureExcess * (1.35 + 1.65 * temperatureRamp) + 0.5)
+        local valveFailureRateStep = math.floor(coolantTemperatureExcess * (1.20 + 1.80 * temperatureRamp) + 0.5)
+        local sparkPlugFailureRateStep = math.floor(coolantTemperatureExcess * (0.85 + 1.10 * temperatureRamp) + 0.5)
+        local oilPressureFailureRateStep = math.floor(coolantTemperatureExcess * (0.55 + 0.85 * temperatureRamp) + 0.5)
+        
+        -- Add an extra cliff once coolant is well past the threshold. This
+        -- mirrors the older implementation where very hot running piled on
+        -- fuel-pump and valve risk much faster.
+        if coolantTemp > highEngineTempThreshold + 12 then
+            local extraHotTemperatureExcess = coolantTemp - (highEngineTempThreshold + 12)
+            fuelPumpFailureRateStep = fuelPumpFailureRateStep + math.floor(extraHotTemperatureExcess * 0.8 + 0.5)
+            valveFailureRateStep = valveFailureRateStep + math.floor(extraHotTemperatureExcess * 1.0 + 0.5)
+            sparkPlugFailureRateStep = sparkPlugFailureRateStep + math.floor(extraHotTemperatureExcess * 0.55 + 0.5)
+            oilPressureFailureRateStep = oilPressureFailureRateStep + math.floor(extraHotTemperatureExcess * 0.35 + 0.5)
+        end
 
-        cumulativeRateChanges.highCoolantTemp.fuelPump = cumulativeRateChanges.highCoolantTemp.fuelPump + math.floor(tempDiff + 0.5)
-        cumulativeRateChanges.highCoolantTemp.valveDamage = cumulativeRateChanges.highCoolantTemp.valveDamage + math.floor(tempDiff + 0.5)
+        printDebug("High coolant", "ACTIVE: " .. coolantTemperatureExcess .. " | FP step: " .. fuelPumpFailureRateStep .. " | V step: " .. valveFailureRateStep)
+        failureRates.sparkPlug = failureRates.sparkPlug - sparkPlugFailureRateStep
+        failureRates.fuelPump = failureRates.fuelPump - fuelPumpFailureRateStep
+        failureRates.valveDamage = failureRates.valveDamage - valveFailureRateStep
+        failureRates.oilPressure = failureRates.oilPressure - oilPressureFailureRateStep
+
+        cumulativeRateChanges.highCoolantTemp.sparkPlug = cumulativeRateChanges.highCoolantTemp.sparkPlug + sparkPlugFailureRateStep
+        cumulativeRateChanges.highCoolantTemp.fuelPump = cumulativeRateChanges.highCoolantTemp.fuelPump + fuelPumpFailureRateStep
+        cumulativeRateChanges.highCoolantTemp.valveDamage = cumulativeRateChanges.highCoolantTemp.valveDamage + valveFailureRateStep
+        cumulativeRateChanges.highCoolantTemp.oilPressure = cumulativeRateChanges.highCoolantTemp.oilPressure + oilPressureFailureRateStep
 
         if coolantHandleDebugLoggingCounter == 0 then
             logDebug("<FRH>High coolant temperature: " .. coolantTemp .. " C")
             logDebug("Current rates:")
-            logDebug(" Fpump: " .. failureRates.fuelPump .. ", VDmg: " .. failureRates.valveDamage)
+            logDebug(" SPlug: " .. failureRates.sparkPlug ..
+                    ", Fpump: " .. failureRates.fuelPump ..
+                    ", VDmg: " .. failureRates.valveDamage ..
+                    ", OPres: " .. failureRates.oilPressure ..
+                    " | steps SP: " .. sparkPlugFailureRateStep ..
+                    ", FP: " .. fuelPumpFailureRateStep ..
+                    ", V: " .. valveFailureRateStep ..
+                    ", OP: " .. oilPressureFailureRateStep)
         end
         coolantHandleDebugLoggingCounter = (coolantHandleDebugLoggingCounter + 1) % coolantHandleDebugLoggingInterval
     else
@@ -297,11 +378,29 @@ function handleRunningTankLow(failureRates, fuelLevel)
     end
 end
 
-function handleRadiatorEfficiency(radiatorCoolCoefficientBase, lowRpm, runningCloseToCarInFrontStep, trackSurfaceType, engineMap)
-    if lowRpm then
-        radiatorCoolCoefficientBase = radiatorCoolCoefficientBase * radiatorEfficiencyLowRpmMultiplier
+function resetRadiatorDustClog()
+    radiatorDustClogLevel = 0
+end
+
+function cleanRadiatorDustClog(cleanFraction)
+    radiatorDustClogLevel = radiatorDustClogLevel * (1 - math.clamp(cleanFraction or radiatorDustClogPitCleanFraction, 0, 1))
+end
+
+local function updateRadiatorDustClog(trackSurfaceType, speedKmh, dt, runningCloseToCarInFrontStep)
+    if trackSurfaceType ~= ac.SurfaceExtendedType.Gravel then
+        return
     end
 
+    local speedFactor = math.clamp((speedKmh or 0) / math.max(radiatorDustClogSpeedReferenceKmh, 1), 0.15, 1.75)
+    local followingFactor = runningCloseToCarInFrontStep > 0 and radiatorDustClogFollowingMultiplier or 1
+    radiatorDustClogLevel = math.clamp(
+        radiatorDustClogLevel + radiatorDustClogBuildRatePerSecond * speedFactor * followingFactor * (dt or 0),
+        0,
+        1
+    )
+end
+
+function handleRadiatorEfficiency(radiatorCoolCoefficientBase, runningCloseToCarInFrontStep, trackSurfaceType, speedKmh, dt)
     if runningCloseToCarInFrontStep > 0 then
         -- This reduces the radiator efficiency based on how close the car is to the car in front,
         -- with e.g. 1 meter resulting in a factor 0.6, 2 meters 0.8 and 3 meters 0.88, etc.
@@ -312,8 +411,8 @@ function handleRadiatorEfficiency(radiatorCoolCoefficientBase, lowRpm, runningCl
         radiatorCoolCoefficientBase = radiatorCoolCoefficientBase * radiatorEfficiencyDustMultiplier
     end
 
-    -- Adjust based on engine map (fuel mixture): rich, normal, lean, push.
-    radiatorCoolCoefficientBase = radiatorCoolCoefficientBase * radiatorEfficiencyEngineMapFactors[engineMap]
+    updateRadiatorDustClog(trackSurfaceType, speedKmh, dt, runningCloseToCarInFrontStep)
+    radiatorCoolCoefficientBase = radiatorCoolCoefficientBase * (1 - radiatorDustClogLevel * radiatorDustClogMaxCoolingLoss)
 
     return radiatorCoolCoefficientBase
 end
